@@ -1,17 +1,25 @@
 import discord
 import asyncio
 import os
+import json
 from datetime import datetime, timedelta
 from openai import OpenAI
 
 # ===================== CONFIG =====================
 
-DISCORD_TOKEN = "PASTE_DISCORD_BOT_TOKEN"
-OPENAI_API_KEY = "PASTE_OPENAI_API_KEY"
-
+DISCORD_TOKEN = "PASTE_YOUR_DISCORD_BOT_TOKEN_HERE"
+OPENAI_API_KEY = "PASTE_YOUR_OPENAI_API_KEY_HERE"
 SCAN_INTERVAL_MINUTES = 15
-MAX_MESSAGES_PER_CHANNEL = 200  # limit for tokens
 MODEL = "gpt-5.1-nano"
+
+# Load config.json
+with open("config.json", "r") as f:
+    config = json.load(f)
+
+ALLOWED_GUILDS = config.get("allowed_guilds", [])
+MAX_MESSAGES_PER_DAY = config.get("max_messages_per_day", 1000)
+
+MAX_MESSAGES_PER_CHANNEL = 200  # limit for tokens per scan
 
 # ================================================
 
@@ -26,12 +34,14 @@ bot = discord.Client(intents=intents)
 
 last_scan_time = None
 next_scan_time = None
+daily_count_reset = datetime.utcnow()
 
 stats = {
     "total": 0,
     "positive": 0,
     "negative": 0,
-    "neutral": 0
+    "neutral": 0,
+    "today": 0
 }
 
 
@@ -51,7 +61,8 @@ async def update_status():
         f"📨 {stats['total']} msgs | "
         f"🙂{stats['positive']} "
         f"😐{stats['neutral']} "
-        f"☠️{stats['negative']}"
+        f"☠️{stats['negative']} | "
+        f"Today: {stats['today']}/{MAX_MESSAGES_PER_DAY}"
     )
     await bot.change_presence(activity=discord.Game(name=status))
 
@@ -63,7 +74,6 @@ def analyze_messages(messages: list[str]):
     Minimal-token prompt.
     Returns dict with sentiment counts.
     """
-
     prompt = f"""
 Analyze Discord chat messages.
 Return ONLY valid JSON.
@@ -88,7 +98,7 @@ Messages:
     response = client.responses.create(
         model=MODEL,
         input=prompt,
-        max_output_tokens=100  # HARD LIMIT
+        max_output_tokens=100
     )
 
     text = response.output_text.strip()
@@ -98,18 +108,32 @@ Messages:
 # ===================== SCANNER =====================
 
 async def scan_all_channels():
-    global stats, last_scan_time
+    global stats, last_scan_time, daily_count_reset
+
+    # Reset daily counter every 24h
+    if datetime.utcnow() - daily_count_reset > timedelta(hours=24):
+        stats['today'] = 0
+        daily_count_reset = datetime.utcnow()
+
+    if stats['today'] >= MAX_MESSAGES_PER_DAY:
+        print("[SCAN] Daily message limit reached, skipping scan.")
+        return False
 
     collected_messages = []
 
     for guild in bot.guilds:
-        for channel in guild.text_channels:
+        if ALLOWED_GUILDS and guild.id not in ALLOWED_GUILDS:
+            continue  # skip guilds not in allowed list
+
+        for channel in getattr(guild, "text_channels", []):
             try:
                 async for msg in channel.history(
                     limit=MAX_MESSAGES_PER_CHANNEL,
                     after=last_scan_time
                 ):
                     if not msg.author.bot and msg.content.strip():
+                        if stats['today'] + len(collected_messages) >= MAX_MESSAGES_PER_DAY:
+                            break
                         collected_messages.append(msg.content.strip())
             except Exception:
                 continue
@@ -123,6 +147,7 @@ async def scan_all_channels():
     result = analyze_messages(collected_messages)
 
     stats["total"] += len(collected_messages)
+    stats["today"] += len(collected_messages)
     stats["positive"] += result.get("positive", 0)
     stats["neutral"] += result.get("neutral", 0)
     stats["negative"] += result.get("negative", 0)
